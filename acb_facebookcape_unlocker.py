@@ -5,7 +5,11 @@ ACB Brotherhood Facebook Cape Unlocker
 
 A self-contained tool for unlocking Facebook-exclusive capes and changing
 player name in AC Brotherhood SAV files.
-Supports both PC and PS3 formats with a console UI.
+Supports both PC and PS3 formats (encrypted or decrypted) with a console UI.
+
+If a PS3 SAV is encrypted, PARAM.PFD must be present in the same directory.
+The file will be decrypted automatically before editing and re-encrypted after
+saving. Already-decrypted files are left in their existing state.
 
 Cape structure in Block 4:
   [cape_hash 4B] [8 zeros] [0x0B marker] [ownership_flag 1B] [cape_id 1B] ...
@@ -35,6 +39,12 @@ try:
 except ImportError:
     HAS_CURSES = False
 
+try:
+    from Crypto.Cipher import AES
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 # Import LZSS compression/decompression
 from lzss import compress, decompress
 
@@ -59,6 +69,167 @@ MAX_NAME_LENGTH = 17  # Game limit
 
 # PS3 file size (padded)
 PS3_FILE_SIZE = 307200  # 0x4B000
+
+# =============================================================================
+# PS3 CRYPTO  (ported from pfd_util.c / bucanero/pfd_sfo_tools)
+# =============================================================================
+#
+# Keys from games.conf for BLES00909 (Assassin's Creed Brotherhood):
+#   syscon_manager_key  = D413B89663E1FE9F75143D3BB4565274
+#   secure_file_id:*    = 0D0E0A0D0B0E0E0F0A0A0A0A0A0A0A0A
+#
+# Crypto chain for decryption:
+#   1. Parse PARAM.PFD  → 64-byte encrypted entry_key + file_size (BE u64)
+#   2. Derive iv_hash_key from secure_file_id (hardcoded bytes at i=1,2,5,8)
+#   3. AES-128-CBC decrypt entry_key (key=syscon_manager_key, iv=iv_hash_key)
+#   4. entry_key[:16]  →  file AES-128 key
+#   5. Per 16-byte block i:
+#        counter  = pack('>QQ', i, 0)            # PS3 big-endian
+#        enc_ctr  = AES_ECB_encrypt(key, counter)
+#        dec_blk  = AES_ECB_decrypt(key, block)
+#        plain    = dec_blk XOR enc_ctr
+# Encryption reverses steps 5: XOR first, then ECB-encrypt.
+
+_SYSCON_MANAGER_KEY = bytes.fromhex("D413B89663E1FE9F75143D3BB4565274")
+_SECURE_FILE_ID     = bytes.fromhex("0D0E0A0D0B0E0E0F0A0A0A0A0A0A0A0A")
+
+_PFD_ENTRY_TABLE_OFFSET = 0x240
+_PFD_ENTRY_SIZE         = 0x110
+_PFD_ENTRY_NAME_OFF     = 0x08
+_PFD_ENTRY_NAME_LEN     = 65
+_PFD_ENTRY_KEY_OFF      = 0x50
+_PFD_ENTRY_KEY_LEN      = 64
+_PFD_ENTRY_FSIZE_OFF    = 0x108
+_PFD_MAX_ENTRIES        = 0x72
+_AES_BLOCK              = 16
+
+
+def _find_pfd_entry(pfd_data: bytes, filename: str):
+    """Find entry in PARAM.PFD and return (enc_key_64b, file_size_be)."""
+    for i in range(_PFD_MAX_ENTRIES):
+        off = _PFD_ENTRY_TABLE_OFFSET + i * _PFD_ENTRY_SIZE
+        if off + _PFD_ENTRY_SIZE > len(pfd_data):
+            break
+        raw = pfd_data[off + _PFD_ENTRY_NAME_OFF : off + _PFD_ENTRY_NAME_OFF + _PFD_ENTRY_NAME_LEN]
+        name = raw.split(b'\x00')[0].decode('ascii', errors='replace')
+        if name == filename:
+            enc_key = pfd_data[off + _PFD_ENTRY_KEY_OFF : off + _PFD_ENTRY_KEY_OFF + _PFD_ENTRY_KEY_LEN]
+            fsize   = struct.unpack_from('>Q', pfd_data, off + _PFD_ENTRY_FSIZE_OFF)[0]
+            return enc_key, fsize
+    return None, None
+
+
+def _derive_iv_hash_key(secure_key: bytes) -> bytes:
+    """Build iv_hash_key from secure_file_id (mirrors _get_aes_details_pfd)."""
+    iv = bytearray(16)
+    j = 0
+    for i in range(16):
+        if   i == 1: iv[i] = 11
+        elif i == 2: iv[i] = 15
+        elif i == 5: iv[i] = 14
+        elif i == 8: iv[i] = 10
+        else:
+            iv[i] = secure_key[j]; j += 1
+    return bytes(iv)
+
+
+def _get_file_aes_key(enc_entry_key: bytes) -> bytes:
+    """AES-128-CBC decrypt the 64-byte entry key; return first 16 bytes."""
+    iv  = _derive_iv_hash_key(_SECURE_FILE_ID)
+    dec = AES.new(_SYSCON_MANAGER_KEY, AES.MODE_CBC, iv=iv).decrypt(enc_entry_key)
+    return dec[:16]
+
+
+def _ps3_decrypt_data(enc_data: bytes, file_key: bytes, file_size: int) -> bytes:
+    """Decrypt PS3 save data (ECB-decrypt then XOR counter, per block)."""
+    aligned = ((file_size + _AES_BLOCK - 1) // _AES_BLOCK) * _AES_BLOCK
+    if len(enc_data) < aligned:
+        enc_data = enc_data + b'\x00' * (aligned - len(enc_data))
+    aes_enc = AES.new(file_key, AES.MODE_ECB)
+    aes_dec = AES.new(file_key, AES.MODE_ECB)
+    result  = bytearray(aligned)
+    for i in range(aligned // _AES_BLOCK):
+        off     = i * _AES_BLOCK
+        ctr     = aes_enc.encrypt(struct.pack('>QQ', i, 0))
+        dec_blk = aes_dec.decrypt(enc_data[off:off + _AES_BLOCK])
+        for j in range(_AES_BLOCK):
+            result[off + j] = dec_blk[j] ^ ctr[j]
+    return bytes(result[:file_size])
+
+
+def _ps3_encrypt_data(plain_data: bytes, file_key: bytes, file_size: int) -> bytes:
+    """Encrypt PS3 save data (XOR counter then ECB-encrypt, per block)."""
+    aligned = ((file_size + _AES_BLOCK - 1) // _AES_BLOCK) * _AES_BLOCK
+    work    = bytearray(plain_data[:file_size].ljust(aligned, b'\x00'))
+    aes_ctr = AES.new(file_key, AES.MODE_ECB)
+    aes_blk = AES.new(file_key, AES.MODE_ECB)
+    for i in range(aligned // _AES_BLOCK):
+        off = i * _AES_BLOCK
+        ctr = aes_ctr.encrypt(struct.pack('>QQ', i, 0))
+        for j in range(_AES_BLOCK):
+            work[off + j] ^= ctr[j]
+        enc = aes_blk.encrypt(bytes(work[off:off + _AES_BLOCK]))
+        work[off:off + _AES_BLOCK] = enc
+    return bytes(work)  # full aligned size
+
+
+def ps3_decrypt_file(sav_path: str) -> bytes:
+    """
+    Decrypt a PS3 SAV using PARAM.PFD from the same directory.
+    Returns the decrypted file bytes.
+    """
+    sav_dir  = os.path.dirname(os.path.abspath(sav_path))
+    filename = os.path.basename(sav_path)
+    pfd_path = os.path.join(sav_dir, 'PARAM.PFD')
+
+    if not os.path.isfile(pfd_path):
+        raise FileNotFoundError(
+            f"PARAM.PFD not found in {sav_dir}\n"
+            "  It must be present alongside the encrypted SAV for decryption."
+        )
+
+    with open(pfd_path, 'rb') as f:
+        pfd_data = f.read()
+    with open(sav_path, 'rb') as f:
+        enc_data = f.read()
+
+    enc_key, file_size = _find_pfd_entry(pfd_data, filename)
+    if enc_key is None:
+        raise ValueError(f"'{filename}' not found in PARAM.PFD")
+
+    file_key  = _get_file_aes_key(enc_key)
+    decrypted = _ps3_decrypt_data(enc_data, file_key, file_size)
+    print(f"  Decrypted '{filename}' ({file_size} bytes) using PARAM.PFD")
+    return decrypted
+
+
+def ps3_encrypt_file(plain_bytes: bytes, sav_path: str) -> bytes:
+    """
+    Encrypt plain SAV bytes back to PS3 format using PARAM.PFD.
+    Returns the encrypted file bytes (padded to PS3_FILE_SIZE).
+    """
+    sav_dir  = os.path.dirname(os.path.abspath(sav_path))
+    filename = os.path.basename(sav_path)
+    pfd_path = os.path.join(sav_dir, 'PARAM.PFD')
+
+    with open(pfd_path, 'rb') as f:
+        pfd_data = f.read()
+
+    enc_key, pfd_size = _find_pfd_entry(pfd_data, filename)
+    if enc_key is None:
+        raise ValueError(f"'{filename}' not found in PARAM.PFD")
+
+    file_key  = _get_file_aes_key(enc_key)
+    file_size = len(plain_bytes)
+    encrypted = _ps3_encrypt_data(plain_bytes, file_key, file_size)
+
+    # Pad to PS3_FILE_SIZE
+    if len(encrypted) < PS3_FILE_SIZE:
+        encrypted = encrypted + b'\x00' * (PS3_FILE_SIZE - len(encrypted))
+
+    print(f"  Re-encrypted '{filename}' ({file_size} bytes)")
+    return encrypted
+
 
 # =============================================================================
 # CHECKSUMS
@@ -97,16 +268,23 @@ def crc32_ps3(data: bytes) -> int:
 # =============================================================================
 
 def detect_format(data: bytes) -> str:
-    """Detect PC or PS3 SAV format."""
+    """
+    Detect PC, PS3 (decrypted), PS3-encrypted, or unknown format.
+
+    Returns one of: 'PC', 'PS3', 'PS3-encrypted', 'unknown'
+    """
     # PS3 files are padded to 307200 bytes
     if len(data) == PS3_FILE_SIZE:
+        # Try PS3 decrypted: 8-byte prefix (size BE + CRC32 BE) must verify
         if len(data) >= 8:
             prefix_size = struct.unpack('>I', data[0:4])[0]
-            prefix_crc = struct.unpack('>I', data[4:8])[0]
+            prefix_crc  = struct.unpack('>I', data[4:8])[0]
             if prefix_size < len(data) - 8:
                 actual_crc = crc32_ps3(data[8:8 + prefix_size])
                 if actual_crc == prefix_crc:
                     return 'PS3'
+        # 307200 bytes but CRC didn't verify → encrypted
+        return 'PS3-encrypted'
 
     # Check for PC format by looking for magic pattern in Block 1 header
     if len(data) > 0x14:
@@ -164,7 +342,7 @@ def _patch_block4_in_block3(block3_raw: bytearray, region4_offset: int,
 
 
 # =============================================================================
-# PC SAV PARSING (from cape_unlocker.py)
+# PC SAV PARSING
 # =============================================================================
 
 def parse_pc_sav_blocks(data: bytes) -> dict:
@@ -223,7 +401,7 @@ def parse_pc_sav_blocks(data: bytes) -> dict:
 
 
 # =============================================================================
-# PS3 SAV PARSING (from cape_unlocker_ps3.py)
+# PS3 SAV PARSING
 # =============================================================================
 
 def parse_ps3_sav_blocks(data: bytes) -> dict:
@@ -295,7 +473,7 @@ def parse_ps3_sav_blocks(data: bytes) -> dict:
 
 
 # =============================================================================
-# NAME HANDLING (from cape_unlocker.py)
+# NAME HANDLING
 # =============================================================================
 
 def find_name_in_block1(data: bytes) -> tuple:
@@ -385,7 +563,7 @@ def change_name_in_block1(data: bytearray, new_name: str) -> bytearray:
 
 
 # =============================================================================
-# CAPE ACCESS (exact copy from cape_unlocker.py)
+# CAPE ACCESS
 # =============================================================================
 
 def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
@@ -522,8 +700,12 @@ def save_pc_sav(filepath: str, blocks: dict, block1_data: bytearray,
 
 
 def save_ps3_sav(filepath: str, blocks: dict, block1_data: bytearray,
-                 block4_data: bytearray, block1_modified: bool, block4_modified: bool):
-    """Save modified PS3 SAV file."""
+                 block4_data: bytearray, block1_modified: bool, block4_modified: bool,
+                 was_encrypted: bool = False):
+    """
+    Save PS3 SAV. If was_encrypted is True, re-encrypts the output using
+    PARAM.PFD from the same directory as filepath.
+    """
     block1_header, block1_compressed, block4_compressed, block3_raw, total_size_diff = \
         _recompress_blocks(blocks, block1_data, block4_data, block1_modified, block4_modified, is_ps3=True)
 
@@ -551,6 +733,10 @@ def save_ps3_sav(filepath: str, blocks: dict, block1_data: bytearray,
 
     if len(output) < PS3_FILE_SIZE:
         output.extend(b'\x00' * (PS3_FILE_SIZE - len(output)))
+
+    if was_encrypted:
+        print("  Re-encrypting modified SAV...")
+        output = bytearray(ps3_encrypt_file(bytes(output), filepath))
 
     with open(filepath, 'wb') as f:
         f.write(output)
@@ -856,16 +1042,48 @@ def main():
     print(f"Loading {filepath}...")
 
     with open(filepath, 'rb') as f:
-        data = f.read()
+        raw_data = f.read()
 
-    platform = detect_format(data)
-    if platform == 'unknown':
+    # ── Encryption detection ──────────────────────────────────────────────────
+    fmt = detect_format(raw_data)
+
+    if fmt == 'PS3-encrypted':
+        print("Detected format: PS3 (encrypted)")
+        if not HAS_CRYPTO:
+            print("Error: pycryptodome is required to decrypt PS3 saves.")
+            print("  Install it with:  pip install pycryptodome")
+            return 1
+        print("  PARAM.PFD found — decrypting before editing...")
+        try:
+            data          = ps3_decrypt_file(filepath)
+            was_encrypted = True
+        except (FileNotFoundError, ValueError) as e:
+            print(f"Error: {e}")
+            return 1
+        # Re-detect on the decrypted bytes to confirm it parsed correctly
+        fmt = detect_format(data)
+        if fmt != 'PS3':
+            print("Error: Decrypted data did not produce a valid PS3 SAV structure.")
+            return 1
+        platform = 'PS3'
+
+    elif fmt == 'PS3':
+        print("Detected format: PS3 (decrypted)")
+        data          = raw_data
+        was_encrypted = False
+        platform      = 'PS3'
+
+    elif fmt == 'PC':
+        print("Detected format: PC")
+        data          = raw_data
+        was_encrypted = False
+        platform      = 'PC'
+
+    else:
         print("Error: Could not detect file format (PC or PS3)")
         return 1
 
-    print(f"Detected format: {platform}")
-
-    # Parse blocks
+    # ── Parse blocks ──────────────────────────────────────────────────────────
     try:
         if platform == 'PC':
             blocks = parse_pc_sav_blocks(data)
@@ -883,7 +1101,7 @@ def main():
     print(f"Block 1: {len(block1_data)} bytes")
     print(f"Block 4: {len(block4_data)} bytes")
 
-    # Run UI
+    # ── Run UI ────────────────────────────────────────────────────────────────
     if HAS_CURSES:
         try:
             should_save, new_name = curses.wrapper(
@@ -924,13 +1142,15 @@ def main():
         if not block1_modified and not block4_modified:
             print("\nNo changes to save.")
         else:
-            print(f"\nSaving to {filepath}...")
+            enc_note = " (will re-encrypt)" if was_encrypted else ""
+            print(f"\nSaving to {filepath}{enc_note}...")
             if platform == 'PC':
                 save_pc_sav(filepath, blocks, block1_data, block4_data,
                             block1_modified, block4_modified)
             else:
                 save_ps3_sav(filepath, blocks, block1_data, block4_data,
-                             block1_modified, block4_modified)
+                             block1_modified, block4_modified,
+                             was_encrypted=was_encrypted)
             print("Done!")
     else:
         print("\nNo changes saved.")
