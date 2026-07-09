@@ -535,9 +535,9 @@ def find_cape_record(data: bytes, cape_hash: int, expected_id: int) -> int:
 
     The whole fixed structure is validated, not just the hash: the 8-byte zero
     run, the 0x0B marker, and the cape_id must all line up. Matching on the hash
-    (and even the cape_id) alone produces false positives, because the cape_id is
-    shared across many inventory entries and the hash bytes also appear inside
-    Block 5 compact reference lists that are not ownership records.
+    (and even the cape_id) alone produces false positives, because the cape_id
+    is shared across many inventory entries and 4-byte hash look-alikes occur
+    elsewhere in the 32 KB frames being scanned.
     """
     hash_bytes = struct.pack('<I', cape_hash)
     pos = 0

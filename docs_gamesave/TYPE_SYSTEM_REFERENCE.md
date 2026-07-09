@@ -2,6 +2,11 @@
 
 This document provides a comprehensive reference to the Scimitar Engine type system used in Assassin's Creed Brotherhood's save files (SAV and OPTIONS). The information was reverse-engineered from ACBSP.exe through Ghidra decompilation and WinDbg time-travel debugging.
 
+> **Note (July 2026):** the executable-derived type system documented here is
+> valid. Any mentions of SAV "Block 3"/"Block 5" use the deprecated 5-block
+> naming — those are LZSS-compressed frames, and byte-level claims about their
+> raw content were compression artifacts. See SAV_BLOCKS_OVERVIEW.md.
+
 ## Table of Contents
 
 1. [Overview](#overview)

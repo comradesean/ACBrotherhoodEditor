@@ -1,5 +1,12 @@
 # Block 2 Game State Structure
 
+> **Note (July 2026):** the Block 2 analysis in this document is valid (it was
+> performed on correctly decompressed data). Any mentions of "Block 3",
+> "Block 4", or "Block 5" use the deprecated 5-block naming — those are LZSS
+> frames located by content — and cross-references to Block 3/5 "compact" or
+> "Judy Array" raw content were derived from compressed bytes (artifacts).
+> See SAV_BLOCKS_OVERVIEW.md for the corrected structure.
+
 ## Overview
 
 Block 2 is the main game state block in Assassin's Creed Brotherhood SAV files. It is LZSS compressed and decompresses to exactly 32,768 bytes (32 KB).
