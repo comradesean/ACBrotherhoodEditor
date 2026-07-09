@@ -74,7 +74,7 @@ CAPE_DEFINITIONS = [
 #   [hash 4B] [8 zero bytes] [0x0B marker] [ownership_flag 1B] [cape_id 1B]
 #    +0..+3    +4..+11        +12           +13                 +14
 # All four fixed fields are validated together when locating a cape (see
-# find_cape_in_block4). The hash + cape_id alone are NOT sufficient: the same
+# find_cape_record). The hash + cape_id alone are NOT sufficient: the same
 # cape_id is reused by many inventory entries, and 4-byte hash look-alikes
 # occur elsewhere in the 32 KB frames being scanned. Requiring the zero-run
 # and the 0x0B marker rejects those impostors.
@@ -407,16 +407,16 @@ def parse_sav_blocks(data: bytes, is_ps3: bool) -> dict:
     for header_offset, comp_size in frames:
         frame_data = decompress(payload[header_offset + _FRAME_HEADER_SIZE:
                                          header_offset + _FRAME_HEADER_SIZE + comp_size])
-        if all(find_cape_in_block4(frame_data, cape_hash, cape_id) != -1
+        if all(find_cape_record(frame_data, cape_hash, cape_id) != -1
                for cape_hash, cape_id, _ in CAPE_DEFINITIONS):
             cape_frames.append((header_offset, comp_size))
 
     if cape_frames:
         primary_offset, primary_size = cape_frames[0]
-        block4_compressed = payload[primary_offset + _FRAME_HEADER_SIZE:
+        cape_frame_compressed = payload[primary_offset + _FRAME_HEADER_SIZE:
                                     primary_offset + _FRAME_HEADER_SIZE + primary_size]
     else:
-        block4_compressed = b''
+        cape_frame_compressed = b''
 
     return {
         'is_ps3': is_ps3,
@@ -426,7 +426,7 @@ def parse_sav_blocks(data: bytes, is_ps3: bool) -> dict:
         'block2_header_offset': b2_header_offset,
         'frames': frames,
         'cape_frames': cape_frames,
-        'block4_compressed': block4_compressed,
+        'cape_frame_compressed': cape_frame_compressed,
     }
 
 
@@ -524,9 +524,10 @@ def change_name_in_block1(data: bytearray, new_name: str) -> bytearray:
 # CAPE ACCESS
 # =============================================================================
 
-def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
+def find_cape_record(data: bytes, cape_hash: int, expected_id: int) -> int:
     """
-    Find a cape ownership record in Block 4 by searching for its hash.
+    Find a cape ownership record in a decompressed inventory frame by
+    searching for its hash.
 
     Cape record: [hash 4B] [8 zeros] [0x0B marker] [flag 1B] [cape_id 1B]
 
@@ -562,7 +563,7 @@ def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
 
 def get_cape_state(data: bytes, cape_hash: int, expected_id: int) -> bool:
     """Get cape unlock state (True = unlocked)."""
-    offset = find_cape_in_block4(data, cape_hash, expected_id)
+    offset = find_cape_record(data, cape_hash, expected_id)
     if offset == -1 or offset >= len(data):
         return False
     return data[offset] != 0
@@ -570,7 +571,7 @@ def get_cape_state(data: bytes, cape_hash: int, expected_id: int) -> bool:
 
 def set_cape_state(data: bytearray, cape_hash: int, expected_id: int, unlocked: bool):
     """Set cape unlock state."""
-    offset = find_cape_in_block4(data, cape_hash, expected_id)
+    offset = find_cape_record(data, cape_hash, expected_id)
     if offset != -1 and offset < len(data):
         data[offset] = 0x01 if unlocked else 0x00
 
@@ -608,7 +609,7 @@ def _build_block1_header(compressed_data: bytes, uncompressed_size: int, is_ps3:
 
 
 def save_sav(filepath: str, blocks: dict, block1_data: bytearray,
-             block4_data: bytearray, block1_modified: bool, block4_modified: bool,
+             cape_frame_data: bytearray, block1_modified: bool, capes_modified: bool,
              was_encrypted: bool = False):
     """
     Save a modified SAV (PC or PS3) by splicing changed pieces into the
@@ -623,14 +624,14 @@ def save_sav(filepath: str, blocks: dict, block1_data: bytearray,
     payload = bytearray(blocks['payload'])
     frames_size_diff = 0
 
-    if block4_modified:
+    if capes_modified:
         # Splice back-to-front so earlier frame offsets stay valid
         for header_offset, comp_size in sorted(blocks['cape_frames'], reverse=True):
             data_start = header_offset + _FRAME_HEADER_SIZE
             frame_data = bytearray(decompress(bytes(payload[data_start:data_start + comp_size])))
             for cape_hash, cape_id, _ in CAPE_DEFINITIONS:
                 set_cape_state(frame_data, cape_hash, cape_id,
-                               get_cape_state(block4_data, cape_hash, cape_id))
+                               get_cape_state(cape_frame_data, cape_hash, cape_id))
             new_compressed = compress(bytes(frame_data))
             _patch_frame_header(payload, header_offset, len(new_compressed),
                                 adler32_zero_seed(new_compressed))
@@ -695,24 +696,24 @@ def build_unlock_items() -> list:
     return items
 
 
-def load_unlock_states(items: list, block1_data: bytes, block4_data: bytes):
+def load_unlock_states(items: list, block1_data: bytes, cape_frame_data: bytes):
     """Load current states from decompressed block data."""
     for item in items:
         if item.is_name:
             _, _, name = find_name_in_block1(block1_data)
             item.name_value = name if name else "Unknown"
         else:
-            item.checked = get_cape_state(block4_data, item.hash_value, item.expected_id)
+            item.checked = get_cape_state(cape_frame_data, item.hash_value, item.expected_id)
 
 
-def apply_unlock_states(items: list, block1_data: bytearray, block4_data: bytearray) -> None:
+def apply_unlock_states(items: list, block1_data: bytearray, cape_frame_data: bytearray) -> None:
     """Apply unlock states to block data."""
     for item in items:
         if item.is_name:
             continue  # Name handled separately
-        old_state = get_cape_state(block4_data, item.hash_value, item.expected_id)
+        old_state = get_cape_state(cape_frame_data, item.hash_value, item.expected_id)
         if old_state != item.checked:
-            set_cape_state(block4_data, item.hash_value, item.expected_id, item.checked)
+            set_cape_state(cape_frame_data, item.hash_value, item.expected_id, item.checked)
 
 
 # =============================================================================
@@ -720,7 +721,7 @@ def apply_unlock_states(items: list, block1_data: bytearray, block4_data: bytear
 # =============================================================================
 
 def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
-           block1_data: bytearray, block4_data: bytearray) -> tuple:
+           block1_data: bytearray, cape_frame_data: bytearray) -> tuple:
     """Run the curses UI. Returns (should_save, new_name or None)."""
     curses.curs_set(0)
     curses.use_default_colors()
@@ -731,7 +732,7 @@ def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
 
     items = build_unlock_items()
-    load_unlock_states(items, block1_data, block4_data)
+    load_unlock_states(items, block1_data, cape_frame_data)
 
     selected = 0
     modified = False
@@ -809,7 +810,7 @@ def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
 
         elif key in (ord('s'), ord('S')):
             # Apply changes to block data
-            apply_unlock_states(items, block1_data, block4_data)
+            apply_unlock_states(items, block1_data, cape_frame_data)
             return (True, new_name)
 
         elif key in (curses.KEY_UP, ord('k')):
@@ -870,10 +871,10 @@ def clear_screen():
 
 
 def run_text_ui(filepath: str, platform: str, blocks: dict,
-                block1_data: bytearray, block4_data: bytearray) -> tuple:
+                block1_data: bytearray, cape_frame_data: bytearray) -> tuple:
     """Run simple text-based UI. Returns (should_save, new_name or None)."""
     items = build_unlock_items()
-    load_unlock_states(items, block1_data, block4_data)
+    load_unlock_states(items, block1_data, cape_frame_data)
     new_name = None
 
     while True:
@@ -917,7 +918,7 @@ def run_text_ui(filepath: str, platform: str, blocks: dict,
         if choice == 'Q':
             return (False, None)
         elif choice == 'S':
-            apply_unlock_states(items, block1_data, block4_data)
+            apply_unlock_states(items, block1_data, cape_frame_data)
             return (True, new_name)
         elif choice == 'A':
             for item in items:
@@ -1025,25 +1026,25 @@ def main():
         print("  Cape unlocking is unavailable for this file; name editing still works.")
 
     block1_data = bytearray(decompress(blocks['block1_compressed']))
-    block4_data = bytearray(decompress(blocks['block4_compressed']))
+    cape_frame_data = bytearray(decompress(blocks['cape_frame_compressed']))
 
     # ── Run UI ────────────────────────────────────────────────────────────────
     if HAS_CURSES:
         try:
             should_save, new_name = curses.wrapper(
                 lambda stdscr: run_ui(stdscr, filepath, platform, blocks,
-                                      block1_data, block4_data))
+                                      block1_data, cape_frame_data))
         except KeyboardInterrupt:
             print("\nCancelled.")
             return 0
     else:
         should_save, new_name = run_text_ui(filepath, platform, blocks,
-                                            block1_data, block4_data)
+                                            block1_data, cape_frame_data)
 
     if should_save:
         # Check what was modified
         block1_modified = False
-        block4_modified = False
+        capes_modified = False
 
         # Check if name was actually changed (compare to original)
         if new_name:
@@ -1056,22 +1057,22 @@ def main():
                 print(f"Name unchanged: {new_name}")
 
         # Check if any capes were modified
-        orig_block4 = decompress(blocks['block4_compressed'])
+        orig_cape_frame = decompress(blocks['cape_frame_compressed'])
         for hash_val, expected_id, name in CAPE_DEFINITIONS:
-            orig_state = get_cape_state(orig_block4, hash_val, expected_id)
-            new_state = get_cape_state(block4_data, hash_val, expected_id)
+            orig_state = get_cape_state(orig_cape_frame, hash_val, expected_id)
+            new_state = get_cape_state(cape_frame_data, hash_val, expected_id)
             if orig_state != new_state:
-                block4_modified = True
+                capes_modified = True
                 status = "UNLOCKED" if new_state else "LOCKED"
                 print(f"{name}: {status}")
 
-        if not block1_modified and not block4_modified:
+        if not block1_modified and not capes_modified:
             print("\nNo changes to save.")
         else:
             enc_note = " (will re-encrypt)" if was_encrypted else ""
             print(f"\nSaving to {filepath}{enc_note}...")
-            save_sav(filepath, blocks, block1_data, block4_data,
-                     block1_modified, block4_modified,
+            save_sav(filepath, blocks, block1_data, cape_frame_data,
+                     block1_modified, capes_modified,
                      was_encrypted=was_encrypted)
             print("Done!")
     else:
