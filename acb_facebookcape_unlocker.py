@@ -59,7 +59,18 @@ CAPE_DEFINITIONS = [
     (0xDD79A225, 0x11, "Medici Cape"),
 ]
 
-# Ownership flag is at hash_offset + 13, cape_id at hash_offset + 14
+# Ownership record layout, measured from the start of the 4-byte cape hash:
+#   [hash 4B] [8 zero bytes] [0x0B marker] [ownership_flag 1B] [cape_id 1B]
+#    +0..+3    +4..+11        +12           +13                 +14
+# All four fixed fields are validated together when locating a cape (see
+# find_cape_in_block4). The hash + cape_id alone are NOT sufficient: the same
+# cape_id is reused by many inventory entries, and the raw hash bytes also turn
+# up inside compact reference lists (e.g. Block 5) that are not ownership
+# records. Requiring the zero-run and the 0x0B marker rejects those impostors.
+CAPE_ZERO_RUN_OFFSET = 4
+CAPE_ZERO_RUN_LENGTH = 8
+CAPE_MARKER_OFFSET = 12
+CAPE_MARKER = 0x0B
 OWNERSHIP_FLAG_OFFSET = 13
 CAPE_ID_OFFSET = 14
 
@@ -271,26 +282,33 @@ def detect_format(data: bytes) -> str:
     """
     Detect PC, PS3 (decrypted), PS3-encrypted, or unknown format.
 
+    Detection is driven by structural signatures first and file size only as a
+    last-resort fallback. File size is a poor discriminator: a corrupt or
+    foreign file padded to the PS3 length should not be assumed encrypted, and a
+    decrypted PS3 save should be recognised by its header rather than by being
+    exactly PS3_FILE_SIZE bytes.
+
     Returns one of: 'PC', 'PS3', 'PS3-encrypted', 'unknown'
     """
-    # PS3 files are padded to 307200 bytes
-    if len(data) == PS3_FILE_SIZE:
-        # Try PS3 decrypted: 8-byte prefix (size BE + CRC32 BE) must verify
-        if len(data) >= 8:
-            prefix_size = struct.unpack('>I', data[0:4])[0]
-            prefix_crc  = struct.unpack('>I', data[4:8])[0]
-            if prefix_size < len(data) - 8:
-                actual_crc = crc32_ps3(data[8:8 + prefix_size])
-                if actual_crc == prefix_crc:
-                    return 'PS3'
-        # 307200 bytes but CRC didn't verify → encrypted
-        return 'PS3-encrypted'
+    # 1. PS3 decrypted — positive signature: the 8-byte prefix (payload size BE +
+    #    CRC32 BE) verifies against the payload. This is the strong signal, so it
+    #    leads regardless of total file size.
+    if len(data) >= 8:
+        prefix_size = struct.unpack('>I', data[0:4])[0]
+        prefix_crc  = struct.unpack('>I', data[4:8])[0]
+        if 0 < prefix_size <= len(data) - 8:
+            if crc32_ps3(data[8:8 + prefix_size]) == prefix_crc:
+                return 'PS3'
 
-    # Check for PC format by looking for magic pattern in Block 1 header
-    if len(data) > 0x14:
-        magic = data[0x10:0x14]
-        if magic == b'\x33\xAA\xFB\x57':  # GUID low
-            return 'PC'
+    # 2. PC — positive signature: the GUID-low magic in the Block 1 header.
+    if len(data) > 0x14 and data[0x10:0x14] == b'\x33\xAA\xFB\x57':
+        return 'PC'
+
+    # 3. No plaintext signature matched. A file padded to the PS3 save size is
+    #    almost certainly an encrypted PS3 save (ciphertext is effectively random,
+    #    so neither signature above can match). Anything else is unrecognised.
+    if len(data) == PS3_FILE_SIZE:
+        return 'PS3-encrypted'
 
     return 'unknown'
 
@@ -568,12 +586,17 @@ def change_name_in_block1(data: bytearray, new_name: str) -> bytearray:
 
 def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
     """
-    Find a cape in Block 4 by searching for its hash.
+    Find a cape ownership record in Block 4 by searching for its hash.
 
-    Cape structure: [hash 4B] [8 zeros] [0B] [flag 1B] [cape_id 1B]
+    Cape record: [hash 4B] [8 zeros] [0x0B marker] [flag 1B] [cape_id 1B]
 
     Returns the offset of the ownership flag, or -1 if not found.
-    Verifies the cape_id at hash_offset + 14 matches expected_id.
+
+    The whole fixed structure is validated, not just the hash: the 8-byte zero
+    run, the 0x0B marker, and the cape_id must all line up. Matching on the hash
+    (and even the cape_id) alone produces false positives, because the cape_id is
+    shared across many inventory entries and the hash bytes also appear inside
+    Block 5 compact reference lists that are not ownership records.
     """
     hash_bytes = struct.pack('<I', cape_hash)
     pos = 0
@@ -583,17 +606,18 @@ def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
         if pos == -1:
             return -1
 
-        # Check if cape_id matches at expected offset
         id_offset = pos + CAPE_ID_OFFSET
+        zero_run_end = pos + CAPE_ZERO_RUN_OFFSET + CAPE_ZERO_RUN_LENGTH
         if id_offset < len(data):
-            actual_id = data[id_offset]
-            if actual_id == expected_id:
-                # Found it! Return ownership flag offset
+            is_record = (
+                data[pos + CAPE_ZERO_RUN_OFFSET:zero_run_end] == b'\x00' * CAPE_ZERO_RUN_LENGTH
+                and data[pos + CAPE_MARKER_OFFSET] == CAPE_MARKER
+                and data[id_offset] == expected_id
+            )
+            if is_record:
                 return pos + OWNERSHIP_FLAG_OFFSET
 
         pos += 1
-
-    return -1
 
 
 def get_cape_state(data: bytes, cape_hash: int, expected_id: int) -> bool:
