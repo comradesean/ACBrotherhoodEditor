@@ -1,9 +1,14 @@
 {
-  "description": "Cape item mappings for AC Brotherhood SAV files (Block 4)",
-  "block": 4,
+  "description": "Cape item mappings for AC Brotherhood SAV files (inside the LZSS-compressed inventory frame)",
+  "location": "One of the LZSS frames following Block 2 holds the inventory. The frame index varies with game progression (frame #3 on a fresh save, #9-#15 on played saves) and a save may carry the records in more than one frame, so the frame must be located by decompressing and searching for the records. Verified identical on PC and PS3.",
   "format": "PhysicalInventoryItem",
   "structure": {
+    "layout": "[hash 4B LE][8 zero bytes][0x0B marker][ownership_flag 1B][cape_id 1B]",
     "hash_offset": 0,
+    "zero_run_offset": 4,
+    "zero_run_length": 8,
+    "marker_offset": 12,
+    "marker_value": "0x0B",
     "ownership_flag_offset": 13,
     "cape_id_offset": 14
   },
@@ -22,7 +27,8 @@
     }
   ],
   "unlock_method": {
-    "description": "Find cape by hash in Block 4, verify ID at hash_offset+14, set byte at hash_offset+13 to 0x01",
-    "tool": "cape_unlocker.py"
+    "description": "Decompress each frame after Block 2, find the frame(s) containing both cape records (validate hash + zero run + 0x0B marker + cape id), set the byte at hash_offset+13 to 0x01 in every such frame, recompress, update the frame header's size and adler32, then rebuild the PS3 prefix CRC32 and re-encrypt if applicable",
+    "tool": "acb_facebookcape_unlocker.py",
+    "verified": "In-game on PC, PS3 (US), and PS3 (EU) saves, July 2026"
   }
 }

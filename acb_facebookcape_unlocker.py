@@ -11,8 +11,19 @@ If a PS3 SAV is encrypted, PARAM.PFD must be present in the same directory.
 The file will be decrypted automatically before editing and re-encrypted after
 saving. Already-decrypted files are left in their existing state.
 
-Cape structure in Block 4:
-  [cape_hash 4B] [8 zeros] [0x0B marker] [ownership_flag 1B] [cape_id 1B] ...
+File structure (PC and PS3 share it; PS3 adds an 8-byte size+CRC32 prefix and
+zero-padding to 307200 bytes):
+  Block 1: LZSS, 44-byte header — SaveGame root (player name lives here)
+  Block 2: LZSS, 44-byte header — game state
+  Then N self-contained frames, each:
+    [0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE][LZSS data]
+  Each frame decompresses to 32 KB. N grows with game progression (6 on a
+  fresh save, 14-16 on played saves), and the frame holding the inventory --
+  and with it the cape ownership records -- moves accordingly, so it must be
+  located by content, not position.
+
+Cape record (inside the decompressed inventory frame):
+  [cape_hash 4B] [8 zeros] [0x0B marker] [ownership_flag 1B] [cape_id 1B]
 
 Cape identification:
   Venetian Cape: Hash 0x4470F39F, ID 0x0E
@@ -59,7 +70,18 @@ CAPE_DEFINITIONS = [
     (0xDD79A225, 0x11, "Medici Cape"),
 ]
 
-# Ownership flag is at hash_offset + 13, cape_id at hash_offset + 14
+# Ownership record layout, measured from the start of the 4-byte cape hash:
+#   [hash 4B] [8 zero bytes] [0x0B marker] [ownership_flag 1B] [cape_id 1B]
+#    +0..+3    +4..+11        +12           +13                 +14
+# All four fixed fields are validated together when locating a cape (see
+# find_cape_record). The hash + cape_id alone are NOT sufficient: the same
+# cape_id is reused by many inventory entries, and 4-byte hash look-alikes
+# occur elsewhere in the 32 KB frames being scanned. Requiring the zero-run
+# and the 0x0B marker rejects those impostors.
+CAPE_ZERO_RUN_OFFSET = 4
+CAPE_ZERO_RUN_LENGTH = 8
+CAPE_MARKER_OFFSET = 12
+CAPE_MARKER = 0x0B
 OWNERSHIP_FLAG_OFFSET = 13
 CAPE_ID_OFFSET = 14
 
@@ -271,204 +293,140 @@ def detect_format(data: bytes) -> str:
     """
     Detect PC, PS3 (decrypted), PS3-encrypted, or unknown format.
 
+    Detection is driven by structural signatures first and file size only as a
+    last-resort fallback. File size is a poor discriminator: a corrupt or
+    foreign file padded to the PS3 length should not be assumed encrypted, and a
+    decrypted PS3 save should be recognised by its header rather than by being
+    exactly PS3_FILE_SIZE bytes.
+
     Returns one of: 'PC', 'PS3', 'PS3-encrypted', 'unknown'
     """
-    # PS3 files are padded to 307200 bytes
-    if len(data) == PS3_FILE_SIZE:
-        # Try PS3 decrypted: 8-byte prefix (size BE + CRC32 BE) must verify
-        if len(data) >= 8:
-            prefix_size = struct.unpack('>I', data[0:4])[0]
-            prefix_crc  = struct.unpack('>I', data[4:8])[0]
-            if prefix_size < len(data) - 8:
-                actual_crc = crc32_ps3(data[8:8 + prefix_size])
-                if actual_crc == prefix_crc:
-                    return 'PS3'
-        # 307200 bytes but CRC didn't verify → encrypted
-        return 'PS3-encrypted'
+    # 1. PS3 decrypted — positive signature: the 8-byte prefix (payload size BE +
+    #    CRC32 BE) verifies against the payload. This is the strong signal, so it
+    #    leads regardless of total file size.
+    if len(data) >= 8:
+        prefix_size = struct.unpack('>I', data[0:4])[0]
+        prefix_crc  = struct.unpack('>I', data[4:8])[0]
+        if 0 < prefix_size <= len(data) - 8:
+            if crc32_ps3(data[8:8 + prefix_size]) == prefix_crc:
+                return 'PS3'
 
-    # Check for PC format by looking for magic pattern in Block 1 header
-    if len(data) > 0x14:
-        magic = data[0x10:0x14]
-        if magic == b'\x33\xAA\xFB\x57':  # GUID low
-            return 'PC'
+    # 2. PC — positive signature: the GUID-low magic in the Block 1 header.
+    if len(data) > 0x14 and data[0x10:0x14] == b'\x33\xAA\xFB\x57':
+        return 'PC'
+
+    # 3. No plaintext signature matched. A file padded to the PS3 save size is
+    #    almost certainly an encrypted PS3 save (ciphertext is effectively random,
+    #    so neither signature above can match). Anything else is unrecognised.
+    if len(data) == PS3_FILE_SIZE:
+        return 'PS3-encrypted'
 
     return 'unknown'
 
 
 # =============================================================================
-# SHARED PARSING HELPERS
+# SAV PARSING (shared PC/PS3)
 # =============================================================================
 
-def _find_block3_regions(data: bytes, start_offset: int, total_size: int) -> list:
+# Frame header: [0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE]
+_FRAME_HEADER_SIZE = 13
+
+
+def _scan_frames(payload: bytes, start: int) -> list:
     """
-    Find all 4 region headers in Block 3.
+    Enumerate the LZSS frames that follow Block 2.
 
-    Returns list of (offset, size) tuples for each region.
+    A candidate header is accepted only if the adler32 it stores matches the
+    data span it declares, so stale frame-shaped bytes in growth space cannot
+    produce phantom frames.
+
+    Returns a list of (header_offset, comp_size) tuples.
     """
-    regions = []
-    search_pos = start_offset
-    for region_num in range(4):
-        while search_pos < total_size - 8:
-            if (data[search_pos] == 0x01 and
-                data[search_pos+4:search_pos+8] == b'\x00\x00\x80\x00'):
-                region_size = struct.unpack('<I', data[search_pos+1:search_pos+4] + b'\x00')[0]
-                if 0 < region_size < 50000:
-                    regions.append((search_pos, region_size))
-                    search_pos = search_pos + 8 + region_size + 5
-                    break
-            search_pos += 1
-    return regions
+    frames = []
+    pos = start
+    while pos < len(payload) - _FRAME_HEADER_SIZE:
+        if payload[pos] == 0x01 and payload[pos+4:pos+8] == b'\x00\x00\x80\x00':
+            comp_size = struct.unpack('<I', payload[pos+1:pos+4] + b'\x00')[0]
+            data_start = pos + _FRAME_HEADER_SIZE
+            if 0 < comp_size <= len(payload) - data_start:
+                stored_checksum = struct.unpack('<I', payload[pos+9:pos+13])[0]
+                if adler32_zero_seed(payload[data_start:data_start + comp_size]) == stored_checksum:
+                    frames.append((pos, comp_size))
+                    pos = data_start + comp_size
+                    continue
+        pos += 1
+    return frames
 
 
-def _patch_block4_in_block3(block3_raw: bytearray, region4_offset: int,
-                            block4_recompressed: bytes) -> None:
+def _patch_frame_header(payload: bytearray, header_offset: int, comp_size: int,
+                        checksum: int) -> None:
+    """Write a frame's compressed size and adler32 into its 13-byte header."""
+    payload[header_offset+1:header_offset+4] = struct.pack('<I', comp_size)[:3]
+    payload[header_offset+9:header_offset+13] = struct.pack('<I', checksum)
+
+
+def parse_sav_blocks(data: bytes, is_ps3: bool) -> dict:
     """
-    Patch Block 3's Region 4 header with new Block 4 size and checksum.
+    Parse a decrypted SAV file: blocks 1-2, then the frame sequence.
 
-    Modifies block3_raw in place.
+    The frame holding the cape records is located by content — decompress
+    every frame and look for both cape records — because its position varies
+    with game progression. A save may carry the cape records in more than one
+    frame; all of them are returned so edits can be applied consistently.
     """
-    # Update size
-    old_b4_size = struct.unpack('<I', bytes(block3_raw[region4_offset+1:region4_offset+4]) + b'\x00')[0]
-    new_b4_size = len(block4_recompressed)
-    if old_b4_size != new_b4_size:
-        size_bytes = struct.pack('<I', new_b4_size)[:3]
-        block3_raw[region4_offset+1:region4_offset+4] = size_bytes
-
-    # Update checksum
-    old_checksum = struct.unpack('<I', bytes(block3_raw[region4_offset+9:region4_offset+13]))[0]
-    new_checksum = adler32_zero_seed(block4_recompressed)
-    if old_checksum != new_checksum:
-        block3_raw[region4_offset+9:region4_offset+13] = struct.pack('<I', new_checksum)
-
-
-# =============================================================================
-# PC SAV PARSING
-# =============================================================================
-
-def parse_pc_sav_blocks(data: bytes) -> dict:
-    """Parse PC SAV file and extract all 5 blocks."""
-    total_size = len(data)
-
-    # Block 1: 44-byte header at offset 0, then compressed data
-    block1_compressed_size = struct.unpack('<I', data[0x20:0x24])[0]
-    block1_compressed = data[0x2C:0x2C + block1_compressed_size]
-
-    # Block 2: 44-byte header immediately after Block 1
-    block2_header_offset = 0x2C + block1_compressed_size
-    block2_compressed_size = struct.unpack('<I', data[block2_header_offset + 0x20:block2_header_offset + 0x24])[0]
-    block2_data_offset = block2_header_offset + 44
-    block2_compressed = data[block2_data_offset:block2_data_offset + block2_compressed_size]
-
-    # Block 3: Raw data with 4 regions
-    block3_offset = block2_data_offset + block2_compressed_size
-
-    # Find all 4 region headers in Block 3
-    block3_regions = _find_block3_regions(data, block3_offset, total_size)
-
-    # Region 4's declared size equals Block 4's compressed size
-    if len(block3_regions) >= 4:
-        region4_offset, block4_compressed_size = block3_regions[3]
-        # Block 3 ends after Region 4 header (8 bytes) + 5-byte local data
-        block3_end = region4_offset + 8 + 5
-        block3_size = block3_end - block3_offset
+    if is_ps3:
+        if len(data) < 8:
+            raise ValueError("File too small for PS3 SAV format")
+        ps3_size = struct.unpack('>I', data[0:4])[0]
+        if ps3_size > len(data) - 8:
+            raise ValueError("PS3 prefix declares more data than the file holds")
+        payload = data[8:8 + ps3_size]
     else:
-        raise ValueError(f"Could not parse Block 3 headers, found {len(block3_regions)} regions")
+        payload = data
 
-    block3_raw = data[block3_offset:block3_offset + block3_size]
+    if len(payload) < 88:
+        raise ValueError("File too small for SAV block structure")
 
-    # Calculate Region 4's offset within Block 3 (for later patching)
-    region4_offset_in_block3 = region4_offset - block3_offset
-
-    # Block 4: LZSS compressed, size from Region 4's declared value
-    block4_offset = block3_offset + block3_size
-    block4_compressed = data[block4_offset:block4_offset + block4_compressed_size]
-
-    # Block 5: Rest of file
-    block5_offset = block4_offset + block4_compressed_size
-    block5_raw = data[block5_offset:]
-
-    return {
-        'block1_header': data[0:0x2C],
-        'block1_compressed': block1_compressed,
-        'block2_header_offset': block2_header_offset,
-        'block2_header': data[block2_header_offset:block2_header_offset + 44],
-        'block2_compressed': block2_compressed,
-        'block3_raw': block3_raw,
-        'block4_compressed': block4_compressed,
-        'block5_raw': block5_raw,
-        'region4_offset_in_block3': region4_offset_in_block3,
-    }
-
-
-# =============================================================================
-# PS3 SAV PARSING
-# =============================================================================
-
-def parse_ps3_sav_blocks(data: bytes) -> dict:
-    """Parse PS3 SAV file and extract all 5 blocks."""
-    # Verify PS3 prefix
-    if len(data) < 8:
-        raise ValueError("File too small for PS3 SAV format")
-
-    ps3_size = struct.unpack('>I', data[0:4])[0]
-    ps3_checksum = struct.unpack('>I', data[4:8])[0]
-
-    # SAV data starts after 8-byte prefix
-    sav_data = data[8:]
-    total_size = len(sav_data)
-
-    # Block 1: 44-byte header, sizes at offset 0x20 (LE)
-    b1_comp_size = struct.unpack('<I', sav_data[0x20:0x24])[0]
-    b1_uncomp_size = struct.unpack('<I', sav_data[0x24:0x28])[0]
-    b1_checksum = struct.unpack('<I', sav_data[0x28:0x2C])[0]
-    b1_compressed = sav_data[44:44 + b1_comp_size]
+    # Block 1: 44-byte header, compressed size at +0x20 (LE)
+    b1_comp_size = struct.unpack('<I', payload[0x20:0x24])[0]
 
     # Block 2: 44-byte header immediately after Block 1
     b2_header_offset = 44 + b1_comp_size
-    b2_comp_size = struct.unpack('<I', sav_data[b2_header_offset + 0x20:b2_header_offset + 0x24])[0]
-    b2_uncomp_size = struct.unpack('<I', sav_data[b2_header_offset + 0x24:b2_header_offset + 0x28])[0]
-    b2_checksum = struct.unpack('<I', sav_data[b2_header_offset + 0x28:b2_header_offset + 0x2C])[0]
-    b2_data_offset = b2_header_offset + 44
-    b2_compressed = sav_data[b2_data_offset:b2_data_offset + b2_comp_size]
+    if b2_header_offset + 44 > len(payload):
+        raise ValueError("Block 2 header lies beyond end of file")
+    b2_comp_size = struct.unpack('<I', payload[b2_header_offset + 0x20:b2_header_offset + 0x24])[0]
 
-    # Block 3: Raw data with 4 regions
-    b3_offset = b2_data_offset + b2_comp_size
+    # Everything after Block 2 is a sequence of self-contained LZSS frames
+    frame_area_offset = b2_header_offset + 44 + b2_comp_size
+    frames = _scan_frames(payload, frame_area_offset)
+    if not frames:
+        raise ValueError("No valid LZSS frames found after Block 2")
 
-    # Find all 4 region headers in Block 3
-    block3_regions = _find_block3_regions(sav_data, b3_offset, total_size)
+    # Select the frame(s) holding the cape ownership records by content
+    cape_frames = []
+    for header_offset, comp_size in frames:
+        frame_data = decompress(payload[header_offset + _FRAME_HEADER_SIZE:
+                                         header_offset + _FRAME_HEADER_SIZE + comp_size])
+        if all(find_cape_record(frame_data, cape_hash, cape_id) != -1
+               for cape_hash, cape_id, _ in CAPE_DEFINITIONS):
+            cape_frames.append((header_offset, comp_size))
 
-    if len(block3_regions) < 4:
-        raise ValueError(f"Could not parse Block 3 headers, found {len(block3_regions)} regions")
-
-    # Region 4's declared size equals Block 4's compressed size
-    region4_offset, b4_comp_size = block3_regions[3]
-    b3_end = region4_offset + 8 + 5
-    b3_size = b3_end - b3_offset
-    b3_raw = sav_data[b3_offset:b3_offset + b3_size]
-
-    region4_offset_in_block3 = region4_offset - b3_offset
-
-    # Block 4: LZSS compressed
-    b4_offset = b3_offset + b3_size
-    b4_compressed = sav_data[b4_offset:b4_offset + b4_comp_size]
-
-    # Block 5: Rest of actual data (before padding)
-    b5_offset = b4_offset + b4_comp_size
-    actual_end = ps3_size
-    b5_raw = sav_data[b5_offset:actual_end]
+    if cape_frames:
+        primary_offset, primary_size = cape_frames[0]
+        cape_frame_compressed = payload[primary_offset + _FRAME_HEADER_SIZE:
+                                    primary_offset + _FRAME_HEADER_SIZE + primary_size]
+    else:
+        cape_frame_compressed = b''
 
     return {
-        'ps3_size': ps3_size,
-        'ps3_checksum': ps3_checksum,
-        'block1_header': sav_data[0:44],
-        'block1_compressed': b1_compressed,
+        'is_ps3': is_ps3,
+        'payload': bytes(payload),
+        'block1_comp_size': b1_comp_size,
+        'block1_compressed': payload[44:44 + b1_comp_size],
         'block2_header_offset': b2_header_offset,
-        'block2_header': sav_data[b2_header_offset:b2_header_offset + 44],
-        'block2_compressed': b2_compressed,
-        'block3_raw': b3_raw,
-        'block4_compressed': b4_compressed,
-        'block5_raw': b5_raw,
-        'region4_offset_in_block3': region4_offset_in_block3,
+        'frames': frames,
+        'cape_frames': cape_frames,
+        'cape_frame_compressed': cape_frame_compressed,
     }
 
 
@@ -566,14 +524,20 @@ def change_name_in_block1(data: bytearray, new_name: str) -> bytearray:
 # CAPE ACCESS
 # =============================================================================
 
-def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
+def find_cape_record(data: bytes, cape_hash: int, expected_id: int) -> int:
     """
-    Find a cape in Block 4 by searching for its hash.
+    Find a cape ownership record in a decompressed inventory frame by
+    searching for its hash.
 
-    Cape structure: [hash 4B] [8 zeros] [0B] [flag 1B] [cape_id 1B]
+    Cape record: [hash 4B] [8 zeros] [0x0B marker] [flag 1B] [cape_id 1B]
 
     Returns the offset of the ownership flag, or -1 if not found.
-    Verifies the cape_id at hash_offset + 14 matches expected_id.
+
+    The whole fixed structure is validated, not just the hash: the 8-byte zero
+    run, the 0x0B marker, and the cape_id must all line up. Matching on the hash
+    (and even the cape_id) alone produces false positives, because the cape_id
+    is shared across many inventory entries and 4-byte hash look-alikes occur
+    elsewhere in the 32 KB frames being scanned.
     """
     hash_bytes = struct.pack('<I', cape_hash)
     pos = 0
@@ -583,22 +547,23 @@ def find_cape_in_block4(data: bytes, cape_hash: int, expected_id: int) -> int:
         if pos == -1:
             return -1
 
-        # Check if cape_id matches at expected offset
         id_offset = pos + CAPE_ID_OFFSET
+        zero_run_end = pos + CAPE_ZERO_RUN_OFFSET + CAPE_ZERO_RUN_LENGTH
         if id_offset < len(data):
-            actual_id = data[id_offset]
-            if actual_id == expected_id:
-                # Found it! Return ownership flag offset
+            is_record = (
+                data[pos + CAPE_ZERO_RUN_OFFSET:zero_run_end] == b'\x00' * CAPE_ZERO_RUN_LENGTH
+                and data[pos + CAPE_MARKER_OFFSET] == CAPE_MARKER
+                and data[id_offset] == expected_id
+            )
+            if is_record:
                 return pos + OWNERSHIP_FLAG_OFFSET
 
         pos += 1
 
-    return -1
-
 
 def get_cape_state(data: bytes, cape_hash: int, expected_id: int) -> bool:
     """Get cape unlock state (True = unlocked)."""
-    offset = find_cape_in_block4(data, cape_hash, expected_id)
+    offset = find_cape_record(data, cape_hash, expected_id)
     if offset == -1 or offset >= len(data):
         return False
     return data[offset] != 0
@@ -606,7 +571,7 @@ def get_cape_state(data: bytes, cape_hash: int, expected_id: int) -> bool:
 
 def set_cape_state(data: bytearray, cape_hash: int, expected_id: int, unlocked: bool):
     """Set cape unlock state."""
-    offset = find_cape_in_block4(data, cape_hash, expected_id)
+    offset = find_cape_record(data, cape_hash, expected_id)
     if offset != -1 and offset < len(data):
         data[offset] = 0x01 if unlocked else 0x00
 
@@ -643,100 +608,61 @@ def _build_block1_header(compressed_data: bytes, uncompressed_size: int, is_ps3:
             comp_size, uncompressed_size, checksum)
 
 
-def _recompress_blocks(blocks: dict, block1_data: bytearray, block4_data: bytearray,
-                       block1_modified: bool, block4_modified: bool, is_ps3: bool) -> tuple:
+def save_sav(filepath: str, blocks: dict, block1_data: bytearray,
+             cape_frame_data: bytearray, block1_modified: bool, capes_modified: bool,
+             was_encrypted: bool = False):
     """
-    Recompress modified blocks and patch Block 3.
+    Save a modified SAV (PC or PS3) by splicing changed pieces into the
+    original payload, leaving every untouched byte identical.
 
-    Returns (block1_header, block1_compressed, block4_compressed, block3_raw, total_size_diff)
+    Cape changes are applied to EVERY frame that holds the cape records (a
+    save can carry more than one copy), each recompressed with its header's
+    size and adler32 updated. If was_encrypted is True the PS3 output is
+    re-encrypted using PARAM.PFD from the same directory as filepath.
     """
-    block3_raw = bytearray(blocks['block3_raw'])
-    region4_offset = blocks['region4_offset_in_block3']
-    total_size_diff = 0
+    is_ps3 = blocks['is_ps3']
+    payload = bytearray(blocks['payload'])
+    frames_size_diff = 0
 
-    # Handle Block 1
+    if capes_modified:
+        # Splice back-to-front so earlier frame offsets stay valid
+        for header_offset, comp_size in sorted(blocks['cape_frames'], reverse=True):
+            data_start = header_offset + _FRAME_HEADER_SIZE
+            frame_data = bytearray(decompress(bytes(payload[data_start:data_start + comp_size])))
+            for cape_hash, cape_id, _ in CAPE_DEFINITIONS:
+                set_cape_state(frame_data, cape_hash, cape_id,
+                               get_cape_state(cape_frame_data, cape_hash, cape_id))
+            new_compressed = compress(bytes(frame_data))
+            _patch_frame_header(payload, header_offset, len(new_compressed),
+                                adler32_zero_seed(new_compressed))
+            payload[data_start:data_start + comp_size] = new_compressed
+            frames_size_diff += len(new_compressed) - comp_size
+
+    # Block 2's Field1 counts the bytes that follow it, so only size changes
+    # in the frame area affect it (Block 1 sits before it and does not).
+    if frames_size_diff != 0:
+        b2h = blocks['block2_header_offset']
+        field1_fmt = '>I' if is_ps3 else '<I'
+        old_field1 = struct.unpack(field1_fmt, payload[b2h:b2h+4])[0]
+        payload[b2h:b2h+4] = struct.pack(field1_fmt, old_field1 + frames_size_diff)
+
     if block1_modified:
         block1_compressed = compress(bytes(block1_data))
         block1_header = _build_block1_header(block1_compressed, len(block1_data), is_ps3)
-        total_size_diff += len(block1_compressed) - len(blocks['block1_compressed'])
+        payload[0:44 + blocks['block1_comp_size']] = block1_header + block1_compressed
+
+    if is_ps3:
+        output = bytearray()
+        output.extend(struct.pack('>I', len(payload)))
+        output.extend(struct.pack('>I', crc32_ps3(bytes(payload))))
+        output.extend(payload)
+        if len(output) < PS3_FILE_SIZE:
+            output.extend(b'\x00' * (PS3_FILE_SIZE - len(output)))
+        if was_encrypted:
+            print("  Re-encrypting modified SAV...")
+            output = bytearray(ps3_encrypt_file(bytes(output), filepath))
     else:
-        block1_header = blocks['block1_header']
-        block1_compressed = blocks['block1_compressed']
-
-    # Handle Block 4
-    if block4_modified:
-        block4_compressed = compress(bytes(block4_data))
-        _patch_block4_in_block3(block3_raw, region4_offset, block4_compressed)
-        total_size_diff += len(block4_compressed) - len(blocks['block4_compressed'])
-    else:
-        block4_compressed = blocks['block4_compressed']
-
-    return block1_header, block1_compressed, block4_compressed, block3_raw, total_size_diff
-
-
-def save_pc_sav(filepath: str, blocks: dict, block1_data: bytearray,
-                block4_data: bytearray, block1_modified: bool, block4_modified: bool):
-    """Save modified PC SAV file."""
-    block1_header, block1_compressed, block4_compressed, block3_raw, total_size_diff = \
-        _recompress_blocks(blocks, block1_data, block4_data, block1_modified, block4_modified, is_ps3=False)
-
-    # Get Block 2 header+data and patch Field1 if size changed
-    block2_header_and_data = bytearray(blocks['block2_header'] + blocks['block2_compressed'])
-    if total_size_diff != 0:
-        old_field1 = struct.unpack('<I', block2_header_and_data[0:4])[0]
-        block2_header_and_data[0:4] = struct.pack('<I', old_field1 + total_size_diff)
-
-    # Assemble output file
-    output = bytearray()
-    output.extend(block1_header)
-    output.extend(block1_compressed)
-    output.extend(block2_header_and_data)
-    output.extend(block3_raw)
-    output.extend(block4_compressed)
-    output.extend(blocks['block5_raw'])
-
-    with open(filepath, 'wb') as f:
-        f.write(output)
-
-
-def save_ps3_sav(filepath: str, blocks: dict, block1_data: bytearray,
-                 block4_data: bytearray, block1_modified: bool, block4_modified: bool,
-                 was_encrypted: bool = False):
-    """
-    Save PS3 SAV. If was_encrypted is True, re-encrypts the output using
-    PARAM.PFD from the same directory as filepath.
-    """
-    block1_header, block1_compressed, block4_compressed, block3_raw, total_size_diff = \
-        _recompress_blocks(blocks, block1_data, block4_data, block1_modified, block4_modified, is_ps3=True)
-
-    # Get Block 2 header and patch Field1 if size changed (BE for PS3)
-    block2_header = bytearray(blocks['block2_header'])
-    if total_size_diff != 0:
-        old_field1 = struct.unpack('>I', block2_header[0:4])[0]
-        block2_header[0:4] = struct.pack('>I', old_field1 + total_size_diff)
-
-    # Assemble SAV payload
-    sav_payload = bytearray()
-    sav_payload.extend(block1_header)
-    sav_payload.extend(block1_compressed)
-    sav_payload.extend(block2_header)
-    sav_payload.extend(blocks['block2_compressed'])
-    sav_payload.extend(block3_raw)
-    sav_payload.extend(block4_compressed)
-    sav_payload.extend(blocks['block5_raw'])
-
-    # Build final output with PS3 prefix and padding
-    output = bytearray()
-    output.extend(struct.pack('>I', len(sav_payload)))
-    output.extend(struct.pack('>I', crc32_ps3(bytes(sav_payload))))
-    output.extend(sav_payload)
-
-    if len(output) < PS3_FILE_SIZE:
-        output.extend(b'\x00' * (PS3_FILE_SIZE - len(output)))
-
-    if was_encrypted:
-        print("  Re-encrypting modified SAV...")
-        output = bytearray(ps3_encrypt_file(bytes(output), filepath))
+        output = payload
 
     with open(filepath, 'wb') as f:
         f.write(output)
@@ -770,24 +696,24 @@ def build_unlock_items() -> list:
     return items
 
 
-def load_unlock_states(items: list, block1_data: bytes, block4_data: bytes):
+def load_unlock_states(items: list, block1_data: bytes, cape_frame_data: bytes):
     """Load current states from decompressed block data."""
     for item in items:
         if item.is_name:
             _, _, name = find_name_in_block1(block1_data)
             item.name_value = name if name else "Unknown"
         else:
-            item.checked = get_cape_state(block4_data, item.hash_value, item.expected_id)
+            item.checked = get_cape_state(cape_frame_data, item.hash_value, item.expected_id)
 
 
-def apply_unlock_states(items: list, block1_data: bytearray, block4_data: bytearray) -> None:
+def apply_unlock_states(items: list, block1_data: bytearray, cape_frame_data: bytearray) -> None:
     """Apply unlock states to block data."""
     for item in items:
         if item.is_name:
             continue  # Name handled separately
-        old_state = get_cape_state(block4_data, item.hash_value, item.expected_id)
+        old_state = get_cape_state(cape_frame_data, item.hash_value, item.expected_id)
         if old_state != item.checked:
-            set_cape_state(block4_data, item.hash_value, item.expected_id, item.checked)
+            set_cape_state(cape_frame_data, item.hash_value, item.expected_id, item.checked)
 
 
 # =============================================================================
@@ -795,7 +721,7 @@ def apply_unlock_states(items: list, block1_data: bytearray, block4_data: bytear
 # =============================================================================
 
 def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
-           block1_data: bytearray, block4_data: bytearray) -> tuple:
+           block1_data: bytearray, cape_frame_data: bytearray) -> tuple:
     """Run the curses UI. Returns (should_save, new_name or None)."""
     curses.curs_set(0)
     curses.use_default_colors()
@@ -806,7 +732,7 @@ def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
 
     items = build_unlock_items()
-    load_unlock_states(items, block1_data, block4_data)
+    load_unlock_states(items, block1_data, cape_frame_data)
 
     selected = 0
     modified = False
@@ -884,7 +810,7 @@ def run_ui(stdscr, filepath: str, platform: str, blocks: dict,
 
         elif key in (ord('s'), ord('S')):
             # Apply changes to block data
-            apply_unlock_states(items, block1_data, block4_data)
+            apply_unlock_states(items, block1_data, cape_frame_data)
             return (True, new_name)
 
         elif key in (curses.KEY_UP, ord('k')):
@@ -945,10 +871,10 @@ def clear_screen():
 
 
 def run_text_ui(filepath: str, platform: str, blocks: dict,
-                block1_data: bytearray, block4_data: bytearray) -> tuple:
+                block1_data: bytearray, cape_frame_data: bytearray) -> tuple:
     """Run simple text-based UI. Returns (should_save, new_name or None)."""
     items = build_unlock_items()
-    load_unlock_states(items, block1_data, block4_data)
+    load_unlock_states(items, block1_data, cape_frame_data)
     new_name = None
 
     while True:
@@ -992,7 +918,7 @@ def run_text_ui(filepath: str, platform: str, blocks: dict,
         if choice == 'Q':
             return (False, None)
         elif choice == 'S':
-            apply_unlock_states(items, block1_data, block4_data)
+            apply_unlock_states(items, block1_data, cape_frame_data)
             return (True, new_name)
         elif choice == 'A':
             for item in items:
@@ -1085,39 +1011,40 @@ def main():
 
     # ── Parse blocks ──────────────────────────────────────────────────────────
     try:
-        if platform == 'PC':
-            blocks = parse_pc_sav_blocks(data)
-        else:
-            blocks = parse_ps3_sav_blocks(data)
+        blocks = parse_sav_blocks(data, is_ps3=(platform == 'PS3'))
     except Exception as e:
         print(f"Error parsing SAV file: {e}")
         return 1
 
-    # Decompress Block 1 and Block 4
-    print("Decompressing blocks...")
-    block1_data = bytearray(decompress(blocks['block1_compressed']))
-    block4_data = bytearray(decompress(blocks['block4_compressed']))
+    frame_index_by_offset = {off: i for i, (off, _) in enumerate(blocks['frames'])}
+    cape_frame_indices = [frame_index_by_offset[off] for off, _ in blocks['cape_frames']]
+    print(f"Found {len(blocks['frames'])} data frames; "
+          f"cape records in frame(s): {cape_frame_indices if cape_frame_indices else 'NONE'}")
 
-    print(f"Block 1: {len(block1_data)} bytes")
-    print(f"Block 4: {len(block4_data)} bytes")
+    if not blocks['cape_frames']:
+        print("WARNING: No frame contains the cape records.")
+        print("  Cape unlocking is unavailable for this file; name editing still works.")
+
+    block1_data = bytearray(decompress(blocks['block1_compressed']))
+    cape_frame_data = bytearray(decompress(blocks['cape_frame_compressed']))
 
     # ── Run UI ────────────────────────────────────────────────────────────────
     if HAS_CURSES:
         try:
             should_save, new_name = curses.wrapper(
                 lambda stdscr: run_ui(stdscr, filepath, platform, blocks,
-                                      block1_data, block4_data))
+                                      block1_data, cape_frame_data))
         except KeyboardInterrupt:
             print("\nCancelled.")
             return 0
     else:
         should_save, new_name = run_text_ui(filepath, platform, blocks,
-                                            block1_data, block4_data)
+                                            block1_data, cape_frame_data)
 
     if should_save:
         # Check what was modified
         block1_modified = False
-        block4_modified = False
+        capes_modified = False
 
         # Check if name was actually changed (compare to original)
         if new_name:
@@ -1130,27 +1057,23 @@ def main():
                 print(f"Name unchanged: {new_name}")
 
         # Check if any capes were modified
-        orig_block4 = decompress(blocks['block4_compressed'])
+        orig_cape_frame = decompress(blocks['cape_frame_compressed'])
         for hash_val, expected_id, name in CAPE_DEFINITIONS:
-            orig_state = get_cape_state(orig_block4, hash_val, expected_id)
-            new_state = get_cape_state(block4_data, hash_val, expected_id)
+            orig_state = get_cape_state(orig_cape_frame, hash_val, expected_id)
+            new_state = get_cape_state(cape_frame_data, hash_val, expected_id)
             if orig_state != new_state:
-                block4_modified = True
+                capes_modified = True
                 status = "UNLOCKED" if new_state else "LOCKED"
                 print(f"{name}: {status}")
 
-        if not block1_modified and not block4_modified:
+        if not block1_modified and not capes_modified:
             print("\nNo changes to save.")
         else:
             enc_note = " (will re-encrypt)" if was_encrypted else ""
             print(f"\nSaving to {filepath}{enc_note}...")
-            if platform == 'PC':
-                save_pc_sav(filepath, blocks, block1_data, block4_data,
-                            block1_modified, block4_modified)
-            else:
-                save_ps3_sav(filepath, blocks, block1_data, block4_data,
-                             block1_modified, block4_modified,
-                             was_encrypted=was_encrypted)
+            save_sav(filepath, blocks, block1_data, cape_frame_data,
+                     block1_modified, capes_modified,
+                     was_encrypted=was_encrypted)
             print("Done!")
     else:
         print("\nNo changes saved.")

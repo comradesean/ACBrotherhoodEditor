@@ -8,6 +8,18 @@
 **Engine:** Scimitar Engine
 **Status:** Complete Specification
 
+> **⚠ MAJOR CORRECTION (July 2026):** the 5-block topology this specification
+> assumes (Block 3 with 4 regions, Block 4 at a fixed position, Block 5 as raw
+> trailing data) is a special case: it matches only small fresh saves. In
+> general, everything after Block 2 is a sequence of N self-contained LZSS
+> frames (`[0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE][data]`,
+> each exactly 32 KB decompressed; N is 6 fresh, 14-16 played), and content
+> must be located by decompressing frames, not by position. Sections here
+> describing "Block 3"/"Block 5" raw bytes were analyses of LZSS-compressed
+> data (compression artifacts). Block 1/Block 2 header layouts, checksums,
+> the type system, and decompressed-content analyses remain valid. See
+> SAV_BLOCKS_OVERVIEW.md for the corrected structure summary.
+
 ---
 
 ## Table of Contents

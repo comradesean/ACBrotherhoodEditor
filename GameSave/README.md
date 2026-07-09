@@ -40,7 +40,14 @@ python options_serializer.py game_uncompressed_1.bin game_uncompressed_2.bin gam
 
 ### SAV Files
 
-SAV files store game saves. They contain 5 blocks with different content types.
+> **⚠ SUPERSEDED (July 2026):** `sav_parser.py` and `sav_serializer.py` assume
+> the fixed "5-block" layout below, which is only what a small fresh save looks
+> like. Real saves hold 6-16 LZSS frames after Blocks 1-2, so these scripts
+> extract the wrong data on played saves. Use `../acb_facebookcape_unlocker.py`
+> (which locates content by decompressing every frame) or see the corrected
+> structure in the root README.
+
+SAV files store game saves.
 
 ```bash
 # Parse and extract all blocks
@@ -83,6 +90,16 @@ python lzss_decompressor_final.py compressed.bin
 ```
 
 ### SAV Structure
+
+> **⚠ CORRECTED (July 2026):** the "5-block" table below described a fresh
+> 6-frame save; the "Raw" rows were actually LZSS-compressed frames read as raw
+> bytes. The real layout is Blocks 1-2 followed by N self-contained frames
+> (`[0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE][LZSS data]`),
+> each decompressing to exactly 32 KB, where N grows with game progression
+> (6 fresh, 14-16 played). Content such as the inventory must be located by
+> decompressing frames and inspecting them, not by position.
+
+Historical (incorrect) model kept for reference:
 
 | Block | Format | Size | Content |
 |-------|--------|------|---------|

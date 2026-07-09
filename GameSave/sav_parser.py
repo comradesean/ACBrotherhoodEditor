@@ -3,6 +3,12 @@
 Assassin's Creed Brotherhood Savegame Parser
 ============================================
 
+DEPRECATED (July 2026): this parser hardcodes the fixed 5-block layout below,
+which is only what a small fresh save looks like. Real saves hold 6-16
+self-contained LZSS frames after Blocks 1-2, so on played saves this extracts
+the wrong data. Use ../acb_facebookcape_unlocker.py, which enumerates the
+frames and locates content by decompressing them.
+
 Parser for ACBROTHERHOODSAVEGAME0.SAV files.
 
 File Structure:

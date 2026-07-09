@@ -3,6 +3,12 @@
 Cape Unlocker for AC Brotherhood SAV files
 ==========================================
 
+SUPERSEDED (July 2026) by ../acb_facebookcape_unlocker.py. This version
+assumes the cape records live in the 4th frame ("Block 4"), which is only
+true for small fresh saves; on played saves (6-16 frames) it reads the wrong
+frame. The replacement locates the cape frame by content and validates the
+full record structure.
+
 Unlocks the two Facebook-exclusive capes by searching for cape hashes in Block 4
 and flipping ownership flags. Optionally changes the player name in Block 1.
 

@@ -1,5 +1,17 @@
 # SAV Blocks 3 and 5 Compact Format Specification
 
+> **⚠ INVALIDATED (July 2026):** "Blocks 3 and 5" are not raw compact data.
+> They are LZSS-COMPRESSED frames — every frame header carries an adler32 over
+> its data, and all of them verify (56/56 across five PC/PS3 saves), with each
+> frame decompressing to exactly 32 KB. The byte-level structures documented
+> below (2-byte node prefixes, region layouts, growth buffers, "compact"
+> records) were read from the compressed bytes and are compression artifacts.
+> LZSS control bytes appear every 8 tokens, which is also what made 4-byte
+> hashes seem to appear, vanish, or mutate between saves. Runtime observations
+> made in the debugger (e.g. Judy Array structures in memory during load) may
+> still be genuine, but no file-offset claim in this document should be used.
+> This file is kept as a record of the investigation only.
+
 > **Investigation Status: BREAKTHROUGH** (December 30, 2024)
 >
 > **FOUND:** The compact format uses **Judy Arrays** for property storage! FUN_01b25230 at

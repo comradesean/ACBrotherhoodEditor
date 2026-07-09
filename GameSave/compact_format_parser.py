@@ -3,6 +3,15 @@
 Assassin's Creed Brotherhood - Compact Format Parser
 =====================================================
 
+INVALID (July 2026): "Blocks 3 and 5" are not raw compact data — they are
+LZSS-COMPRESSED frames (each decompressing to exactly 32 KB, verified against
+the adler32 checksums stored in every frame header). This parser reads the
+compressed bytes directly, so the structures it reports (node prefixes,
+regions, growth buffers) are compression artifacts, not file structures.
+Runtime findings from the debugger (e.g. Judy Arrays in memory during load)
+may still hold, but no byte-level conclusion from this parser should be
+trusted. Kept for historical reference only.
+
 Parser for SAV file Blocks 3 and 5 which use a compact binary format
 with Judy Array node serialization and table-based type resolution.
 

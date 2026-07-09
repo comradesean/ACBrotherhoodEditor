@@ -1,6 +1,6 @@
-# AC Brotherhood OPTIONS File Tools
+# AC Brotherhood Save File Tools
 
-Reverse-engineered LZSS compression/decompression tools for Assassin's Creed Brotherhood's OPTIONS save files. Achieves **100% byte-for-byte accuracy** with the game's implementation.
+Reverse-engineered tools for Assassin's Creed Brotherhood's OPTIONS and SAV save files, built on an LZSS implementation that achieves **100% byte-for-byte accuracy** with the game's compressor.
 
 ## Tools
 
@@ -8,7 +8,7 @@ Reverse-engineered LZSS compression/decompression tools for Assassin's Creed Bro
 | Tool | Description |
 |------|-------------|
 | `acb_uplay_unlocker.py` | Unlock uPlay rewards in OPTIONS files |
-| `acb_facebookcape_unlocker.py` | Unlock Facebook cape in OPTIONS files |
+| `acb_facebookcape_unlocker.py` | Unlock the Facebook capes and edit the player name in SAV game saves (PC and PS3, encrypted or decrypted) |
 
 ### OPTIONS File Tools
 | Tool | Description |
@@ -25,12 +25,17 @@ Reverse-engineered LZSS compression/decompression tools for Assassin's Creed Bro
 
 ### Unlock Utilities
 ```bash
-# Unlock uPlay rewards
+# Unlock uPlay rewards (OPTIONS file)
 python acb_uplay_unlocker.py OPTIONS
 
-# Unlock Facebook cape
-python acb_facebookcape_unlocker.py OPTIONS
+# Unlock Facebook capes / edit player name (SAV game save)
+python acb_facebookcape_unlocker.py ACBROTHERHOODSAVEGAME0.SAV   # PC
+python acb_facebookcape_unlocker.py AC2_0.SAV                    # PS3
 ```
+
+For encrypted PS3 saves, `PARAM.PFD` must sit in the same directory as the
+SAV; the file is decrypted automatically and re-encrypted on save (requires
+`pycryptodome`). Already-decrypted PS3 saves need neither.
 
 ### OPTIONS File Tools
 
@@ -105,10 +110,28 @@ See `docs/` for detailed reverse engineering notes:
 - `PS3_vs_PC_STRUCTURE_ANALYSIS.md` - PC/PS3 format differences
 - `ACB_OPTIONS_Header_Complete_Specification.md` - Complete header specification
 
+## SAV File Structure
+
+Game saves (PC and PS3) share one layout; PS3 adds an 8-byte size+CRC32
+prefix and zero-padding to 307,200 bytes, and console saves are encrypted:
+
+```
+[Block 1: 44-byte header + LZSS data]   SaveGame root (player name)
+[Block 2: 44-byte header + LZSS data]   Game state
+[Frame 0..N-1], each:
+  [0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE][LZSS data]
+```
+
+Every frame decompresses to exactly 32 KB. The frame count grows with game
+progression (6 on a fresh save, 14-16 on played ones), so the frame holding
+the inventory — and the cape ownership records — must be located by content,
+not by position. See `docs_gamesave/` for the full format documentation.
+
 ## Requirements
 
 - Python 3.6+
-- No external dependencies
+- No external dependencies for OPTIONS tools and decrypted saves
+- `pycryptodome` (optional) — only for encrypted PS3 SAV saves
 
 ## License
 

@@ -1,3 +1,9 @@
+> **SUPERSEDED (July 2026):** `cape_unlocker.py` / `cape_unlocker_ps3.py` are
+> replaced by `../acb_facebookcape_unlocker.py`, which locates the cape frame
+> by content (real saves hold 6-16 LZSS frames, not the fixed layout these
+> scripts assume) and handles encrypted PS3 saves via PARAM.PFD. The format
+> notes below (PS3 prefix, endianness, CRC32 parameters) remain accurate.
+
   PS3 SAV Format Differences
 
   | Feature           | PC                  | PS3                               |

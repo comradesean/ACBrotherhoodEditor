@@ -1,5 +1,10 @@
 # Block 1: SaveGame Root Structure
 
+> **Note (July 2026):** the Block 1 analysis in this document is valid. Any
+> mentions of "Block 3"/"Block 5" use the deprecated 5-block naming — those
+> are LZSS-compressed frames, and claims about their raw "compact format"
+> content were compression artifacts. See SAV_BLOCKS_OVERVIEW.md.
+
 ## Overview
 
 Block 1 is the root/entry point block for Assassin's Creed Brotherhood save files. It contains the top-level `SaveGame` object which references all other save data.
