@@ -2,6 +2,26 @@
 
 Quick reference for the 5-block structure of AC Brotherhood SAV files.
 
+> **⚠ MAJOR CORRECTION (July 2026):** the "5-block" model below describes only
+> the small fresh reference save this analysis was based on. The validated
+> general structure (checksum-verified across PC and PS3 saves) is:
+>
+> ```
+> [Block 1: 44-byte header + LZSS]  SaveGame root
+> [Block 2: 44-byte header + LZSS]  Game state
+> [Frame 0..N-1], each:
+>   [0x01][comp_size 3B LE][00 00 80 00][1 byte][adler32 4B LE][LZSS data]
+> ```
+>
+> Every frame decompresses to exactly 32 KB, and N grows with progression
+> (6 fresh, 14-16 played). What this document calls "Block 3 regions 1-3" are
+> frames #0-2, "Block 4" is frame #3, and "Block 5" is frames #4 onward. The
+> inventory frame must be located BY CONTENT (decompress and inspect), not by
+> position. All statements below about "Blocks 3/5 raw compact data" were
+> derived from reading LZSS-COMPRESSED bytes and describe compression
+> artifacts, not real structures. Block 1, Block 2, and the decompressed
+> Block 4 (inventory) analyses remain valid.
+
 ---
 
 ## Block Summary

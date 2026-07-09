@@ -1,5 +1,15 @@
 # Block 4 Inventory Structure Analysis
 
+> **Note (July 2026):** the decompressed-content analysis in this document is
+> valid — it was performed on correctly decompressed data. What changed is the
+> framing: "Block 4" is simply one of N self-contained LZSS frames that follow
+> Block 2 (frame #3 on the fresh reference save analyzed here), and its
+> position varies with game progression (frame #9-#15 on played PS3 saves).
+> The "compressed size matching Block 3 Region 4's declared size" is just the
+> frame's own header declaring its data size; the byte before the adler32 plus
+> the checksum are the "5-byte local data" of the old model. Locate this frame
+> by decompressing frames and looking for its content, not by position.
+
 ## Overview
 
 Block 4 contains the player's physical inventory items. It uses **full format** (4-byte type hashes) with LZSS compression but uniquely has **NO 44-byte header** - only 10 zero bytes.

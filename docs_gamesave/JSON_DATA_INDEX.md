@@ -8,7 +8,7 @@ This document describes the JSON data files in the `docs/data/` directory and th
 
 | File | Size | Purpose |
 |------|------|---------|
-| `cape_mappings.json` | 1 KB | Cape item hash/ID mappings for Block 4. Used by cape_unlocker.py. |
+| `cape_mappings.json` | 2 KB | Cape record hashes/IDs and the frame-based unlock method. Used by acb_facebookcape_unlocker.py. |
 | `sav_hash_mapping.json` | 268 KB | Cross-reference mapping between SAV file hashes and EXE-known hashes. Essential for validation. |
 | `sav_type_descriptors_found.json` | 44 KB | Hash match locations in ACBSP.exe for key types (SaveGame, Block2_GameState). Required for type resolution. |
 | `sav_property_tables_extracted.json` | 20 KB | SaveGame property tables with descriptors, flags, and struct offsets. |

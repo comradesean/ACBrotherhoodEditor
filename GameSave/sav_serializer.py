@@ -3,6 +3,10 @@
 SAV Serializer - Round-trip serialization for AC Brotherhood save files
 ========================================================================
 
+DEPRECATED (July 2026): built on the fixed 5-block layout, which only matches
+a small fresh save. Real saves hold 6-16 self-contained LZSS frames after
+Blocks 1-2. Use ../acb_facebookcape_unlocker.py (frame-based splicing) instead.
+
 Rebuilds a SAV file from decompressed/raw blocks with full header and checksum support.
 
 File Layout:
